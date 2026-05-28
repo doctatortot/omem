@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+use super::lancedb::{LanceStore, DEFAULT_VECTOR_DIM};
 use crate::domain::error::OmemError;
 use crate::domain::space::{MemberRole, Space, SpaceType};
-use super::lancedb::{LanceStore, DEFAULT_VECTOR_DIM};
 
 const DEFAULT_MAX_CACHED: usize = 1000;
 
@@ -88,10 +88,13 @@ impl StoreManager {
         store.init_table().await?;
         let store = Arc::new(store);
 
-        cache.insert(tenant_id.to_string(), CacheEntry {
-            store: store.clone(),
-            last_accessed: std::time::Instant::now(),
-        });
+        cache.insert(
+            tenant_id.to_string(),
+            CacheEntry {
+                store: store.clone(),
+                last_accessed: std::time::Instant::now(),
+            },
+        );
 
         Ok(store)
     }
@@ -175,7 +178,10 @@ mod tests {
         let manager = StoreManager::new(dir.path().to_str().expect("path"));
 
         let store1 = manager.get_store("tenant-1").await.expect("get store");
-        let store2 = manager.get_store("tenant-1").await.expect("get store again");
+        let store2 = manager
+            .get_store("tenant-1")
+            .await
+            .expect("get store again");
 
         assert!(Arc::ptr_eq(&store1, &store2));
         assert_eq!(manager.cache_size().await, 1);
@@ -215,11 +221,11 @@ mod tests {
         let mem_b = make_memory("tenant-B", "secret data for B");
         store_b.create(&mem_b, None).await.expect("create in B");
 
-        let list_a = store_a.list(100, 0).await.expect("list A");
+        let list_a = store_a.list(100, 0, false).await.expect("list A");
         assert_eq!(list_a.len(), 1);
         assert_eq!(list_a[0].content, "secret data for A");
 
-        let list_b = store_b.list(100, 0).await.expect("list B");
+        let list_b = store_b.list(100, 0, false).await.expect("list B");
         assert_eq!(list_b.len(), 1);
         assert_eq!(list_b[0].content, "secret data for B");
     }

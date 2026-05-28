@@ -23,6 +23,10 @@ pub struct SearchRequest {
     pub tags_filter: Option<Vec<String>>,
     pub source_filter: Option<String>,
     pub agent_id_filter: Option<String>,
+    /// When true, surface memories whose `state` is `superseded` alongside
+    /// active ones. Default (false) hides them so consumers don't see the
+    /// stale half of a replace-and-consolidate operation.
+    pub include_superseded: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -188,9 +192,13 @@ impl RetrievalPipeline {
         let stage_start = Instant::now();
         let scope = request.scope_filter.as_deref();
 
+        let include_superseded = request.include_superseded;
+
         let vector_fut = async {
             if let Some(ref qv) = request.query_vector {
-                self.store.vector_search(qv, fetch_limit, 0.0, scope, None).await
+                self.store
+                    .vector_search(qv, fetch_limit, 0.0, scope, None, include_superseded)
+                    .await
             } else {
                 Ok(Vec::new())
             }
@@ -198,7 +206,7 @@ impl RetrievalPipeline {
 
         let bm25_fut = async {
             self.store
-                .fts_search(&request.query, fetch_limit, scope, None)
+                .fts_search(&request.query, fetch_limit, scope, None, include_superseded)
                 .await
         };
 
@@ -298,36 +306,18 @@ impl RetrievalPipeline {
         (fused, stage)
     }
 
-    /// Normalize RRF scores to [0, 1] range so downstream thresholds (min_score, hard_cutoff) work correctly.
-    /// RRF raw scores are tiny (max ~0.033 for K=60 with 2 legs), but thresholds expect [0, 1].
-    /// - Multiple results: min-max normalization (best=1.0, worst=0.0)
-    /// - Single result: scale by RRF_SCALE (40.0) and clamp to [0, 1]
+    /// Normalize RRF scores into [0, 1] while preserving absolute quality signal.
+    /// Raw RRF scores are tiny (~1/(K+1) for ideal dual-leg rank-1 match with K=60),
+    /// but downstream thresholds (min_score, hard_cutoff) expect [0, 1]. We scale by
+    /// RRF_SCALE so the best-possible hybrid match maps to ~1.0 and clamp; everything
+    /// weaker stays proportionally smaller.
     fn stage_rrf_normalize(mut entries: Vec<FusionEntry>) -> (Vec<FusionEntry>, StageTrace) {
-        const RRF_SCALE: f32 = 40.0;
+        const RRF_SCALE: f32 = 61.0;
         let stage_start = Instant::now();
         let input_count = entries.len();
 
-        if entries.len() > 1 {
-            let max_score = entries
-                .iter()
-                .map(|e| e.rrf_score)
-                .fold(f32::NEG_INFINITY, f32::max);
-            let min_score = entries
-                .iter()
-                .map(|e| e.rrf_score)
-                .fold(f32::INFINITY, f32::min);
-            let range = max_score - min_score;
-            if range > 0.0 {
-                for entry in &mut entries {
-                    entry.rrf_score = (entry.rrf_score - min_score) / range;
-                }
-            } else if max_score > 0.0 {
-                for entry in &mut entries {
-                    entry.rrf_score = 1.0;
-                }
-            }
-        } else if entries.len() == 1 {
-            entries[0].rrf_score = (entries[0].rrf_score * RRF_SCALE).min(1.0);
+        for entry in &mut entries {
+            entry.rrf_score = (entry.rrf_score * RRF_SCALE).clamp(0.0, 1.0);
         }
 
         let score_range = fusion_score_range(&entries);
@@ -524,22 +514,15 @@ impl RetrievalPipeline {
         (entries, stage)
     }
 
-    fn stage_length_normalization(
-        mut entries: Vec<FusionEntry>,
-    ) -> (Vec<FusionEntry>, StageTrace) {
+    fn stage_length_normalization(entries: Vec<FusionEntry>) -> (Vec<FusionEntry>, StageTrace) {
         let stage_start = Instant::now();
         let input_count = entries.len();
 
-        for entry in &mut entries {
-            let len_ratio = entry.memory.content.len() as f32 / 500.0;
-            let log_val = if len_ratio > 0.0 {
-                len_ratio.log2()
-            } else {
-                0.0
-            };
-            let denominator = (1.0 + log_val).max(1.0);
-            entry.rrf_score /= denominator;
-        }
+        // Length normalization DISABLED. Cosine vector similarity is already
+        // length-invariant, so dividing the fused score by (1 + log2(len/500))
+        // double-penalized long memories — up to ~4x for a 4KB note — burying
+        // detailed runbooks/inventories under short, less-relevant entries.
+        // This is a recall store: document length must not suppress recall.
 
         let score_range = fusion_score_range(&entries);
 
@@ -654,10 +637,7 @@ impl RetrievalPipeline {
             return None;
         }
         let min = all_scores.iter().copied().fold(f32::INFINITY, f32::min);
-        let max = all_scores
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max);
+        let max = all_scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         Some((min, max))
     }
 }
@@ -734,7 +714,11 @@ mod tests {
     async fn test_hybrid_search() {
         let (store, _dir) = setup().await;
 
-        let m1 = make_memory("t-001", "rust programming language is fast", MemoryType::Insight);
+        let m1 = make_memory(
+            "t-001",
+            "rust programming language is fast",
+            MemoryType::Insight,
+        );
         let m2 = make_memory("t-001", "python scripting language", MemoryType::Insight);
         let m3 = make_memory("t-001", "the weather is sunny today", MemoryType::Insight);
 
@@ -763,6 +747,7 @@ mod tests {
             tags_filter: None,
             source_filter: None,
             agent_id_filter: None,
+            include_superseded: false,
         };
 
         let results = pipeline.search(&request).await.expect("search");
@@ -826,6 +811,7 @@ mod tests {
             tags_filter: None,
             source_filter: None,
             agent_id_filter: None,
+            include_superseded: false,
         };
 
         let results = pipeline.search(&request).await.expect("search");
@@ -903,6 +889,7 @@ mod tests {
             tags_filter: None,
             source_filter: None,
             agent_id_filter: None,
+            include_superseded: false,
         };
 
         let results = pipeline
@@ -937,6 +924,7 @@ mod tests {
             tags_filter: None,
             source_filter: None,
             agent_id_filter: None,
+            include_superseded: false,
         };
 
         let results = pipeline.search(&request).await.expect("search");
@@ -979,6 +967,7 @@ mod tests {
             tags_filter: None,
             source_filter: None,
             agent_id_filter: None,
+            include_superseded: false,
         };
 
         let results = pipeline
@@ -1081,14 +1070,17 @@ mod tests {
         let (long_result, _) = RetrievalPipeline::stage_length_normalization(long_entries);
         let long_score = long_result[0].rrf_score;
 
+        // Length normalization is disabled: cosine similarity is already
+        // length-invariant, so a long memory keeps the same fused score as a
+        // short one — no length penalty.
         assert!(
-            short_score > long_score,
-            "short ({short_score}) should score higher than long ({long_score})"
+            (short_score - long_score).abs() < f32::EPSILON,
+            "length must not change the score: short={short_score} long={long_score}"
         );
 
         assert!(
-            (short_score - 1.0).abs() < f32::EPSILON,
-            "short content should not be penalized: got {short_score}"
+            (long_score - 1.0).abs() < f32::EPSILON,
+            "long content must not be penalized by length: got {long_score}"
         );
     }
 
@@ -1159,10 +1151,11 @@ mod tests {
 
     #[test]
     fn test_rrf_normalize_multiple_results() {
+        let ideal = 1.0 / 61.0;
         let entries = vec![
-            make_entry("best", 0.033),
-            make_entry("mid", 0.020),
-            make_entry("worst", 0.010),
+            make_entry("best", ideal),
+            make_entry("mid", ideal * 0.5),
+            make_entry("worst", ideal * 0.25),
         ];
 
         let (result, stage) = RetrievalPipeline::stage_rrf_normalize(entries);
@@ -1170,22 +1163,55 @@ mod tests {
         assert_eq!(result.len(), 3);
 
         let best = result.iter().find(|e| e.memory.content == "best").unwrap();
-        let worst = result.iter().find(|e| e.memory.content == "worst").unwrap();
         let mid = result.iter().find(|e| e.memory.content == "mid").unwrap();
+        let worst = result.iter().find(|e| e.memory.content == "worst").unwrap();
 
-        assert!((best.rrf_score - 1.0).abs() < 1e-6, "best should be 1.0, got {}", best.rrf_score);
-        assert!((worst.rrf_score - 0.0).abs() < 1e-6, "worst should be 0.0, got {}", worst.rrf_score);
-        assert!(mid.rrf_score > 0.0 && mid.rrf_score < 1.0, "mid should be between 0 and 1, got {}", mid.rrf_score);
+        assert!(
+            (best.rrf_score - 1.0).abs() < 1e-4,
+            "ideal RRF should map to ~1.0, got {}",
+            best.rrf_score
+        );
+        assert!(
+            (mid.rrf_score - 0.5).abs() < 1e-4,
+            "half-ideal RRF should map to ~0.5, got {}",
+            mid.rrf_score
+        );
+        assert!(
+            (worst.rrf_score - 0.25).abs() < 1e-4,
+            "quarter-ideal RRF should map to ~0.25, got {}",
+            worst.rrf_score
+        );
+        assert!(best.rrf_score > mid.rrf_score && mid.rrf_score > worst.rrf_score);
+    }
+
+    #[test]
+    fn test_rrf_normalize_weak_top_not_inflated() {
+        let entries = vec![
+            make_entry("weak-top", 0.003),
+            make_entry("weak-mid", 0.002),
+            make_entry("weak-bot", 0.001),
+        ];
+
+        let (result, _) = RetrievalPipeline::stage_rrf_normalize(entries);
+        let top = result
+            .iter()
+            .find(|e| e.memory.content == "weak-top")
+            .unwrap();
+        assert!(
+            top.rrf_score < 0.25,
+            "weak top result should stay below 0.25, got {}",
+            top.rrf_score
+        );
     }
 
     #[test]
     fn test_rrf_normalize_single_result() {
-        let entries = vec![make_entry("only", 0.016)];
+        let entries = vec![make_entry("only", 1.0 / 61.0)];
 
         let (result, _) = RetrievalPipeline::stage_rrf_normalize(entries);
         assert_eq!(result.len(), 1);
         let score = result[0].rrf_score;
-        assert!((score - 0.64).abs() < 1e-4, "0.016 * 40 = 0.64, got {score}");
+        assert!((score - 1.0).abs() < 1e-4, "1/61 * 61 = 1.0, got {score}");
     }
 
     #[test]
@@ -1193,19 +1219,31 @@ mod tests {
         let entries = vec![make_entry("high", 0.05)];
 
         let (result, _) = RetrievalPipeline::stage_rrf_normalize(entries);
-        assert!((result[0].rrf_score - 1.0).abs() < 1e-6, "should clamp to 1.0, got {}", result[0].rrf_score);
+        assert!(
+            (result[0].rrf_score - 1.0).abs() < 1e-6,
+            "should clamp to 1.0, got {}",
+            result[0].rrf_score
+        );
     }
 
     #[test]
     fn test_rrf_normalize_equal_scores() {
-        let entries = vec![
-            make_entry("a", 0.016),
-            make_entry("b", 0.016),
-        ];
+        let entries = vec![make_entry("a", 1.0 / 61.0), make_entry("b", 1.0 / 61.0)];
 
         let (result, _) = RetrievalPipeline::stage_rrf_normalize(entries);
-        assert!((result[0].rrf_score - 1.0).abs() < 1e-6);
-        assert!((result[1].rrf_score - 1.0).abs() < 1e-6);
+        assert!((result[0].rrf_score - 1.0).abs() < 1e-4);
+        assert!((result[1].rrf_score - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_rrf_normalize_equal_weak_scores() {
+        let entries = vec![make_entry("a", 0.005), make_entry("b", 0.005)];
+
+        let (result, _) = RetrievalPipeline::stage_rrf_normalize(entries);
+        let expected = 0.005_f32 * 61.0;
+        assert!((result[0].rrf_score - expected).abs() < 1e-4);
+        assert!((result[1].rrf_score - expected).abs() < 1e-4);
+        assert!(result[0].rrf_score < 0.5);
     }
 
     #[test]

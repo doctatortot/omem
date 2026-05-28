@@ -1,6 +1,7 @@
 pub mod error;
 pub mod handlers;
 pub mod middleware;
+pub mod rate_limit;
 pub mod router;
 pub mod server;
 
@@ -14,6 +15,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
+    use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
     use tower::ServiceExt;
 
     use crate::api::{build_router, AppState};
@@ -51,7 +53,16 @@ mod tests {
         }
     }
 
+    fn install_crypto_provider() {
+        use std::sync::Once;
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+    }
+
     async fn setup_app() -> (axum::Router, tempfile::TempDir) {
+        install_crypto_provider();
         let dir = tempfile::TempDir::new().expect("temp dir");
         let uri = dir.path().to_str().expect("path");
 
@@ -76,6 +87,7 @@ mod tests {
             config: OmemConfig::default(),
             import_semaphore: Arc::new(tokio::sync::Semaphore::new(3)),
             reconcile_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+            share_rate_limiter: Arc::new(crate::api::rate_limit::RateLimiter::new(0)),
         });
 
         (build_router(state), dir)
@@ -105,6 +117,25 @@ mod tests {
             .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
         json["api_key"].as_str().expect("api_key").to_string()
+    }
+
+    async fn create_test_space(app: &axum::Router, api_key: &str) -> String {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/spaces")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", api_key)
+                    .body(Body::from(r#"{"name":"Team Space","space_type":"team"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+        let space: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        space["id"].as_str().expect("space id").to_string()
     }
 
     #[tokio::test]
@@ -462,9 +493,7 @@ mod tests {
                     .uri(format!("/v1/memories/{memory_id}"))
                     .header("content-type", "application/json")
                     .header("x-api-key", &api_key)
-                    .body(Body::from(
-                        r#"{"content":"updated","tags":["new-tag"]}"#,
-                    ))
+                    .body(Body::from(r#"{"content":"updated","tags":["new-tag"]}"#))
                     .expect("request"),
             )
             .await
@@ -481,6 +510,360 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
         assert_eq!(json["content"], "updated");
         assert_eq!(json["tags"][0], "new-tag");
+    }
+
+    #[tokio::test]
+    async fn test_create_memory_with_type() {
+        let (app, _dir) = setup_app().await;
+        let api_key = create_test_tenant(&app).await;
+
+        let create_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/memories")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", &api_key)
+                    .body(Body::from(
+                        r#"{"content":"an insight","memory_type":"insight"}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let bytes = create_resp
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(created["memory_type"], "insight");
+
+        let default_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/memories")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", &api_key)
+                    .body(Body::from(r#"{"content":"default"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let bytes = default_resp
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let default_created: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(default_created["memory_type"], "insight");
+    }
+
+    #[tokio::test]
+    async fn test_update_memory_type() {
+        let (app, _dir) = setup_app().await;
+        let api_key = create_test_tenant(&app).await;
+
+        let create_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/memories")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", &api_key)
+                    .body(Body::from(
+                        r#"{"content":"originally pinned","memory_type":"pinned"}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let bytes = create_resp
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        let memory_id = created["id"].as_str().expect("id");
+        assert_eq!(created["memory_type"], "pinned");
+
+        let update_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/v1/memories/{memory_id}"))
+                    .header("content-type", "application/json")
+                    .header("x-api-key", &api_key)
+                    .body(Body::from(r#"{"memory_type":"insight"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(update_resp.status(), StatusCode::OK);
+        let bytes = update_resp
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(json["memory_type"], "insight");
+    }
+
+    #[tokio::test]
+    async fn test_update_memory_type_invalid() {
+        let (app, _dir) = setup_app().await;
+        let api_key = create_test_tenant(&app).await;
+
+        let create_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/memories")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", &api_key)
+                    .body(Body::from(r#"{"content":"test"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let bytes = create_resp
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        let memory_id = created["id"].as_str().expect("id");
+
+        let update_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/v1/memories/{memory_id}"))
+                    .header("content-type", "application/json")
+                    .header("x-api-key", &api_key)
+                    .body(Body::from(r#"{"memory_type":"bogus"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(update_resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    async fn create_test_memory(app: &axum::Router, api_key: &str, content: &str) -> String {
+        let body = format!(r#"{{"content":"{content}"}}"#);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/memories")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", api_key)
+                    .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        v["id"].as_str().expect("id").to_string()
+    }
+
+    #[tokio::test]
+    async fn test_create_with_replaces_supersedes_old() {
+        let (app, _dir) = setup_app().await;
+        let api_key = create_test_tenant(&app).await;
+
+        let old1 = create_test_memory(&app, &api_key, "fragment one").await;
+        let old2 = create_test_memory(&app, &api_key, "fragment two").await;
+
+        let body = format!(r#"{{"content":"consolidated","replaces":["{old1}","{old2}"]}}"#);
+        let create_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/memories")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", &api_key)
+                    .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(create_resp.status(), StatusCode::CREATED);
+
+        let bytes = create_resp
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let new_mem: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        let new_id = new_mem["id"].as_str().expect("id");
+
+        // Old memories should now be in superseded state via direct fetch.
+        for old_id in [&old1, &old2] {
+            let get_resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/v1/memories/{old_id}"))
+                        .header("x-api-key", &api_key)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(get_resp.status(), StatusCode::OK);
+            let bytes = get_resp
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes();
+            let old: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+            assert_eq!(old["state"], "superseded");
+            assert_eq!(old["superseded_by"], new_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_with_missing_replaces_returns_400() {
+        let (app, _dir) = setup_app().await;
+        let api_key = create_test_tenant(&app).await;
+
+        let real_id = create_test_memory(&app, &api_key, "real one").await;
+
+        // One real id, one ghost id.
+        let body =
+            format!(r#"{{"content":"consolidated","replaces":["{real_id}","ghost-id-nope"]}}"#);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/memories")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", &api_key)
+                    .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+        let err: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        let msg = err["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("ghost-id-nope"),
+            "error should name the missing id, got: {msg}"
+        );
+
+        // The real memory must NOT have been touched.
+        let get_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/memories/{real_id}"))
+                    .header("x-api-key", &api_key)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let bytes = get_resp
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(v["state"], "active");
+    }
+
+    #[tokio::test]
+    async fn test_search_excludes_superseded_by_default() {
+        let (app, _dir) = setup_app().await;
+        let api_key = create_test_tenant(&app).await;
+
+        let old = create_test_memory(&app, &api_key, "fragment about rust programming").await;
+        let body =
+            format!(r#"{{"content":"unified rust programming notes","replaces":["{old}"]}}"#);
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/memories")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", &api_key)
+                    .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        // Default search should NOT surface the superseded old fragment.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/memories/search?q=rust&limit=20")
+                    .header("x-api-key", &api_key)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+        let r: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        let results = r["results"].as_array().expect("results");
+        for res in results {
+            let id = res["memory"]["id"].as_str().unwrap_or_default();
+            assert_ne!(id, old.as_str(), "superseded memory should not appear");
+        }
+
+        // With include_superseded=true, the old should resurface.
+        let resp_inc = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/memories/search?q=rust&limit=20&include_superseded=true")
+                    .header("x-api-key", &api_key)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let bytes = resp_inc
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let r: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        let results = r["results"].as_array().expect("results");
+        let ids: Vec<&str> = results
+            .iter()
+            .map(|res| res["memory"]["id"].as_str().unwrap_or_default())
+            .collect();
+        assert!(
+            ids.contains(&old.as_str()),
+            "old should resurface with include_superseded=true, got ids: {ids:?}"
+        );
     }
 
     #[tokio::test]
@@ -552,11 +935,14 @@ mod tests {
             .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
         assert!(json["static_facts"].as_array().expect("array").is_empty());
-        assert!(json["dynamic_context"].as_array().expect("array").is_empty());
+        assert!(json["dynamic_context"]
+            .as_array()
+            .expect("array")
+            .is_empty());
     }
 
     #[tokio::test]
-    async fn test_tenant_without_name_returns_400() {
+    async fn test_tenant_without_name_auto_generates() {
         let (app, _dir) = setup_app().await;
 
         let response = app
@@ -571,7 +957,16 @@ mod tests {
             .await
             .expect("response");
 
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert!(json["id"].as_str().is_some());
+        assert_eq!(json["status"], "active");
     }
 
     #[tokio::test]
@@ -611,9 +1006,14 @@ mod tests {
             .await
             .expect("response");
 
-        assert!(response.headers().contains_key("access-control-allow-origin"));
+        assert!(response
+            .headers()
+            .contains_key("access-control-allow-origin"));
         assert_eq!(
-            response.headers().get("access-control-allow-origin").unwrap(),
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .unwrap(),
             "*"
         );
     }
@@ -874,9 +1274,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri(format!(
-                        "/v1/stats/decay?memory_id={memory_id}&points=30"
-                    ))
+                    .uri(format!("/v1/stats/decay?memory_id={memory_id}&points=30"))
                     .header("x-api-key", &api_key)
                     .body(Body::empty())
                     .expect("request"),
@@ -1049,9 +1447,7 @@ mod tests {
                     .uri("/v1/spaces")
                     .header("content-type", "application/json")
                     .header("x-api-key", &api_key)
-                    .body(Body::from(
-                        r#"{"name":"Backend Team","space_type":"team"}"#,
-                    ))
+                    .body(Body::from(r#"{"name":"Backend Team","space_type":"team"}"#))
                     .expect("request"),
             )
             .await
@@ -1085,9 +1481,7 @@ mod tests {
                     .uri("/v1/spaces")
                     .header("content-type", "application/json")
                     .header("x-api-key", &api_key)
-                    .body(Body::from(
-                        r#"{"name":"Team A","space_type":"team"}"#,
-                    ))
+                    .body(Body::from(r#"{"name":"Team A","space_type":"team"}"#))
                     .expect("request"),
             )
             .await
@@ -1100,9 +1494,7 @@ mod tests {
                     .uri("/v1/spaces")
                     .header("content-type", "application/json")
                     .header("x-api-key", &api_key)
-                    .body(Body::from(
-                        r#"{"name":"Team B","space_type":"team"}"#,
-                    ))
+                    .body(Body::from(r#"{"name":"Team B","space_type":"team"}"#))
                     .expect("request"),
             )
             .await
@@ -1137,43 +1529,20 @@ mod tests {
     async fn test_add_member() {
         let (app, _dir) = setup_app().await;
         let api_key = create_test_tenant(&app).await;
-
-        let create_resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/spaces")
-                    .header("content-type", "application/json")
-                    .header("x-api-key", &api_key)
-                    .body(Body::from(
-                        r#"{"name":"Team Space","space_type":"team"}"#,
-                    ))
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-
-        let bytes = create_resp
-            .into_body()
-            .collect()
-            .await
-            .expect("body")
-            .to_bytes();
-        let space: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
-        let space_id = space["id"].as_str().expect("id");
+        let space_id = create_test_space(&app, &api_key).await;
 
         let response = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri(format!("/v1/spaces/{space_id}/members"))
+                    .uri(format!(
+                        "/v1/spaces/{}/members",
+                        utf8_percent_encode(&space_id, NON_ALPHANUMERIC)
+                    ))
                     .header("content-type", "application/json")
                     .header("x-api-key", &api_key)
-                    .body(Body::from(
-                        r#"{"user_id":"bob","role":"member"}"#,
-                    ))
+                    .body(Body::from(r#"{"user_id":"bob","role":"member"}"#))
                     .expect("request"),
             )
             .await
@@ -1229,7 +1598,10 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("DELETE")
-                    .uri(format!("/v1/spaces/{space_id}/members/alice"))
+                    .uri(format!(
+                        "/v1/spaces/{}/members/alice",
+                        utf8_percent_encode(&space_id, NON_ALPHANUMERIC)
+                    ))
                     .header("x-api-key", &api_key)
                     .body(Body::empty())
                     .expect("request"),
@@ -1341,9 +1713,7 @@ mod tests {
                     .uri("/v1/spaces")
                     .header("content-type", "application/json")
                     .header("x-api-key", &api_key)
-                    .body(Body::from(
-                        r#"{"name":"Temp","space_type":"team"}"#,
-                    ))
+                    .body(Body::from(r#"{"name":"Temp","space_type":"team"}"#))
                     .expect("request"),
             )
             .await
@@ -1363,7 +1733,10 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("DELETE")
-                    .uri(format!("/v1/spaces/{space_id}"))
+                    .uri(format!(
+                        "/v1/spaces/{}",
+                        utf8_percent_encode(&space_id, NON_ALPHANUMERIC)
+                    ))
                     .header("x-api-key", &api_key)
                     .body(Body::empty())
                     .expect("request"),
@@ -1377,7 +1750,10 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri(format!("/v1/spaces/{space_id}"))
+                    .uri(format!(
+                        "/v1/spaces/{}",
+                        utf8_percent_encode(&space_id, NON_ALPHANUMERIC)
+                    ))
                     .header("x-api-key", &api_key)
                     .body(Body::empty())
                     .expect("request"),
@@ -1423,7 +1799,10 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("PUT")
-                    .uri(format!("/v1/spaces/{space_id}/members/carol"))
+                    .uri(format!(
+                        "/v1/spaces/{}/members/carol",
+                        utf8_percent_encode(&space_id, NON_ALPHANUMERIC)
+                    ))
                     .header("content-type", "application/json")
                     .header("x-api-key", &api_key)
                     .body(Body::from(r#"{"role":"admin"}"#))
@@ -1528,7 +1907,10 @@ mod tests {
         let bytes = resp.into_body().collect().await.expect("body").to_bytes();
         let err: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
         let msg = err["error"]["message"].as_str().unwrap_or("");
-        assert!(msg.contains("duplicate"), "expected duplicate error, got: {msg}");
+        assert!(
+            msg.contains("duplicate"),
+            "expected duplicate error, got: {msg}"
+        );
 
         // --- Third import (same content, force=true): should succeed ---
         let (ct, body) = build_multipart(

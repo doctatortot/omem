@@ -69,10 +69,13 @@ export class OmemClient {
     content: string,
     tags?: string[],
     source?: string,
+    replaces?: string[],
   ): Promise<MemoryDto> {
+    const body: Record<string, unknown> = { content, tags, source };
+    if (replaces && replaces.length > 0) body.replaces = replaces;
     const result = await this.request<MemoryDto>("/v1/memories", {
       method: "POST",
-      body: JSON.stringify({ content, tags, source }),
+      body: JSON.stringify(body),
     });
     if (!result) throw new Error("Failed to create memory");
     return result;
@@ -83,11 +86,13 @@ export class OmemClient {
     limit = 10,
     scope?: string,
     tags?: string[],
+    space?: string,
   ): Promise<SearchResult[]> {
     const safeQ = query.length > 500 ? query.slice(0, 500) : query;
     const params = new URLSearchParams({ q: safeQ, limit: String(limit) });
     if (scope) params.set("scope", scope);
     if (tags && tags.length > 0) params.set("tags", tags.join(","));
+    if (space) params.set("space", space);
     const res = await this.request<SearchResponse>(
       `/v1/memories/search?${params}`,
     );

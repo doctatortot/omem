@@ -8,11 +8,12 @@ use lancedb::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::domain::error::OmemError;
-use crate::domain::space::{SharingEvent, Space};
+use crate::domain::space::{PendingShare, SharingEvent, Space};
 
 const SPACES_TABLE: &str = "spaces";
 const SHARING_EVENTS_TABLE: &str = "sharing_events";
 const IMPORT_TASKS_TABLE: &str = "import_tasks";
+const PENDING_SHARES_TABLE: &str = "pending_shares";
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ImportTaskRecord {
@@ -102,6 +103,16 @@ impl SpaceStore {
                 })?;
         }
 
+        if !existing.contains(&PENDING_SHARES_TABLE.to_string()) {
+            self.spaces_db
+                .create_empty_table(PENDING_SHARES_TABLE, Self::pending_shares_schema())
+                .execute()
+                .await
+                .map_err(|e| {
+                    OmemError::Storage(format!("failed to create pending_shares table: {e}"))
+                })?;
+        }
+
         Ok(())
     }
 
@@ -172,7 +183,10 @@ impl SpaceStore {
             vec![
                 Arc::new(StringArray::from(vec![space.id.as_str()])),
                 Arc::new(StringArray::from(vec![data_json.as_str()])),
-                Arc::new(StringArray::from(vec![space.space_type.to_string().as_str()])),
+                Arc::new(StringArray::from(vec![space
+                    .space_type
+                    .to_string()
+                    .as_str()])),
                 Arc::new(StringArray::from(vec![space.owner_id.as_str()])),
                 Arc::new(StringArray::from(vec![space.created_at.as_str()])),
             ],
@@ -229,9 +243,7 @@ impl SpaceStore {
         for batch in &batches {
             for i in 0..batch.num_rows() {
                 let space = Self::row_to_space(batch, i)?;
-                if space.owner_id == user_id
-                    || space.members.iter().any(|m| m.user_id == user_id)
-                {
+                if space.owner_id == user_id || space.members.iter().any(|m| m.user_id == user_id) {
                     spaces.push(space);
                 }
             }
@@ -370,7 +382,9 @@ impl SpaceStore {
         table
             .delete(&format!("id = '{}'", escape_sql(&task.id)))
             .await
-            .map_err(|e| OmemError::Storage(format!("delete for import task update failed: {e}")))?;
+            .map_err(|e| {
+                OmemError::Storage(format!("delete for import task update failed: {e}"))
+            })?;
 
         self.create_import_task(task).await
     }
@@ -423,6 +437,113 @@ impl SpaceStore {
             }
         }
         Ok(tasks)
+    }
+
+    fn pending_shares_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("target_space", DataType::Utf8, false),
+            Field::new("data", DataType::Utf8, false),
+            Field::new("created_at", DataType::Utf8, false),
+        ]))
+    }
+
+    async fn open_pending_shares_table(&self) -> Result<lancedb::table::Table, OmemError> {
+        self.spaces_db
+            .open_table(PENDING_SHARES_TABLE)
+            .execute()
+            .await
+            .map_err(|e| OmemError::Storage(format!("failed to open pending_shares table: {e}")))
+    }
+
+    pub async fn record_pending_share(&self, pending: &PendingShare) -> Result<(), OmemError> {
+        let data_json = serde_json::to_string(pending)
+            .map_err(|e| OmemError::Storage(format!("failed to serialize pending share: {e}")))?;
+
+        let batch = RecordBatch::try_new(
+            Self::pending_shares_schema(),
+            vec![
+                Arc::new(StringArray::from(vec![pending.id.as_str()])),
+                Arc::new(StringArray::from(vec![pending.target_space.as_str()])),
+                Arc::new(StringArray::from(vec![data_json.as_str()])),
+                Arc::new(StringArray::from(vec![pending.created_at.as_str()])),
+            ],
+        )
+        .map_err(|e| OmemError::Storage(format!("failed to build pending share batch: {e}")))?;
+
+        let table = self.open_pending_shares_table().await?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], Self::pending_shares_schema());
+        table
+            .add(Box::new(reader) as Box<dyn arrow_array::RecordBatchReader + Send>)
+            .execute()
+            .await
+            .map_err(|e| OmemError::Storage(format!("failed to insert pending share: {e}")))?;
+
+        Ok(())
+    }
+
+    pub async fn list_pending_shares(
+        &self,
+        target_space: &str,
+    ) -> Result<Vec<PendingShare>, OmemError> {
+        let table = self.open_pending_shares_table().await?;
+        let batches: Vec<RecordBatch> = table
+            .query()
+            .only_if(format!("target_space = '{}'", escape_sql(target_space)))
+            .execute()
+            .await
+            .map_err(|e| OmemError::Storage(format!("list pending shares query failed: {e}")))?
+            .try_collect()
+            .await
+            .map_err(|e| OmemError::Storage(format!("collect failed: {e}")))?;
+
+        let mut out = Vec::new();
+        for batch in &batches {
+            for i in 0..batch.num_rows() {
+                out.push(Self::row_to_pending_share(batch, i)?);
+            }
+        }
+        Ok(out)
+    }
+
+    pub async fn get_pending_share(&self, id: &str) -> Result<Option<PendingShare>, OmemError> {
+        let table = self.open_pending_shares_table().await?;
+        let batches: Vec<RecordBatch> = table
+            .query()
+            .only_if(format!("id = '{}'", escape_sql(id)))
+            .limit(1)
+            .execute()
+            .await
+            .map_err(|e| OmemError::Storage(format!("pending share query failed: {e}")))?
+            .try_collect()
+            .await
+            .map_err(|e| OmemError::Storage(format!("collect failed: {e}")))?;
+
+        for batch in &batches {
+            if batch.num_rows() > 0 {
+                return Ok(Some(Self::row_to_pending_share(batch, 0)?));
+            }
+        }
+        Ok(None)
+    }
+
+    pub async fn delete_pending_share(&self, id: &str) -> Result<(), OmemError> {
+        let table = self.open_pending_shares_table().await?;
+        table
+            .delete(&format!("id = '{}'", escape_sql(id)))
+            .await
+            .map_err(|e| OmemError::Storage(format!("pending share delete failed: {e}")))?;
+        Ok(())
+    }
+
+    fn row_to_pending_share(batch: &RecordBatch, row: usize) -> Result<PendingShare, OmemError> {
+        let data = batch
+            .column_by_name("data")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| OmemError::Storage("pending_shares missing data column".to_string()))?
+            .value(row);
+        serde_json::from_str(data)
+            .map_err(|e| OmemError::Storage(format!("failed to parse pending share: {e}")))
     }
 
     fn row_to_space(batch: &RecordBatch, row: usize) -> Result<Space, OmemError> {
@@ -553,18 +674,15 @@ mod tests {
         assert_eq!(fetched.space_type, SpaceType::Team);
         assert_eq!(fetched.members.len(), 1);
 
-        let spaces = store
-            .list_spaces_for_user("user-001")
-            .await
-            .expect("list");
+        let spaces = store.list_spaces_for_user("user-001").await.expect("list");
         assert_eq!(spaces.len(), 1);
 
-        store
-            .delete_space("team:backend")
-            .await
-            .expect("delete");
+        store.delete_space("team:backend").await.expect("delete");
 
-        let deleted = store.get_space("team:backend").await.expect("get after delete");
+        let deleted = store
+            .get_space("team:backend")
+            .await
+            .expect("get after delete");
         assert!(deleted.is_none());
     }
 
@@ -579,7 +697,11 @@ mod tests {
         space.updated_at = "2025-06-01T00:00:00Z".to_string();
         store.update_space(&space).await.expect("update");
 
-        let fetched = store.get_space("team:fe").await.expect("get").expect("exists");
+        let fetched = store
+            .get_space("team:fe")
+            .await
+            .expect("get")
+            .expect("exists");
         assert_eq!(fetched.name, "Frontend Team");
     }
 
@@ -595,7 +717,10 @@ mod tests {
         store.create_space(&s2).await.expect("create s2");
         store.create_space(&s3).await.expect("create s3");
 
-        let alice_spaces = store.list_spaces_for_user("alice").await.expect("list alice");
+        let alice_spaces = store
+            .list_spaces_for_user("alice")
+            .await
+            .expect("list alice");
         assert_eq!(alice_spaces.len(), 2);
 
         let bob_spaces = store.list_spaces_for_user("bob").await.expect("list bob");
@@ -647,7 +772,10 @@ mod tests {
     #[tokio::test]
     async fn test_init_tables_idempotent() {
         let (store, _dir) = setup().await;
-        store.init_tables().await.expect("second init should succeed");
+        store
+            .init_tables()
+            .await
+            .expect("second init should succeed");
     }
 
     #[tokio::test]
@@ -672,16 +800,25 @@ mod tests {
             created_at: "2025-01-01T00:00:00Z".to_string(),
             updated_at: "2025-01-01T00:00:00Z".to_string(),
         };
-        store.create_space(&alice_personal).await.expect("create alice personal");
+        store
+            .create_space(&alice_personal)
+            .await
+            .expect("create alice personal");
 
-        let alice_spaces = store.list_spaces_for_user("alice").await.expect("list alice");
+        let alice_spaces = store
+            .list_spaces_for_user("alice")
+            .await
+            .expect("list alice");
         assert_eq!(alice_spaces.len(), 2);
 
         let bob_spaces = store.list_spaces_for_user("bob").await.expect("list bob");
         assert_eq!(bob_spaces.len(), 1);
         assert_eq!(bob_spaces[0].id, "team:backend");
 
-        let charlie_spaces = store.list_spaces_for_user("charlie").await.expect("list charlie");
+        let charlie_spaces = store
+            .list_spaces_for_user("charlie")
+            .await
+            .expect("list charlie");
         assert_eq!(charlie_spaces.len(), 0);
     }
 }

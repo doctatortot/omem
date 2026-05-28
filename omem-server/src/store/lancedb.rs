@@ -24,12 +24,29 @@ use crate::domain::types::{MemoryState, MemoryType, Tier};
 pub const DEFAULT_VECTOR_DIM: i32 = 1024;
 const TABLE_NAME: &str = "memories";
 
+/// Default state filter for search/list operations.
+/// Excludes deleted (soft-deleted) and superseded (replaced by another memory).
+const DEFAULT_STATE_FILTER: &str = "state NOT IN ('deleted', 'superseded')";
+
+/// State filter that includes superseded memories.
+/// Use when an explicit caller wants to see historical/replaced entries.
+const STATE_FILTER_KEEPING_SUPERSEDED: &str = "state != 'deleted'";
+
+fn state_filter(include_superseded: bool) -> &'static str {
+    if include_superseded {
+        STATE_FILTER_KEEPING_SUPERSEDED
+    } else {
+        DEFAULT_STATE_FILTER
+    }
+}
+
 pub struct ListFilter {
     pub category: Option<String>,
     pub tier: Option<String>,
     pub tags: Option<Vec<String>>,
     pub memory_type: Option<String>,
     pub state: Option<String>,
+    pub include_superseded: bool,
     pub sort: String,
     pub order: String,
 }
@@ -42,6 +59,7 @@ impl Default for ListFilter {
             tags: None,
             memory_type: None,
             state: None,
+            include_superseded: false,
             sort: "created_at".to_string(),
             order: "desc".to_string(),
         }
@@ -153,9 +171,7 @@ impl LanceStore {
             table
                 .add_columns(NewColumnTransform::AllNulls(missing_schema), None)
                 .await
-                .map_err(|e| {
-                    OmemError::Storage(format!("failed to add missing columns: {e}"))
-                })?;
+                .map_err(|e| OmemError::Storage(format!("failed to add missing columns: {e}")))?;
         }
 
         Ok(())
@@ -212,7 +228,11 @@ impl LanceStore {
             .map_err(|e| OmemError::Storage(format!("failed to open table: {e}")))
     }
 
-    fn memory_to_batch(&self, memory: &Memory, vector: Option<&[f32]>) -> Result<RecordBatch, OmemError> {
+    fn memory_to_batch(
+        &self,
+        memory: &Memory,
+        vector: Option<&[f32]>,
+    ) -> Result<RecordBatch, OmemError> {
         let tags_json = serde_json::to_string(&memory.tags)
             .map_err(|e| OmemError::Storage(format!("failed to serialize tags: {e}")))?;
         let relations_json = serde_json::to_string(&memory.relations)
@@ -257,8 +277,14 @@ impl LanceStore {
                 Arc::new(StringArray::from(vec![memory.l1_overview.as_str()])),
                 Arc::new(StringArray::from(vec![memory.l2_content.as_str()])),
                 Arc::new(vector_array),
-                Arc::new(StringArray::from(vec![memory.category.to_string().as_str()])),
-                Arc::new(StringArray::from(vec![memory.memory_type.to_string().as_str()])),
+                Arc::new(StringArray::from(vec![memory
+                    .category
+                    .to_string()
+                    .as_str()])),
+                Arc::new(StringArray::from(vec![memory
+                    .memory_type
+                    .to_string()
+                    .as_str()])),
                 Arc::new(StringArray::from(vec![memory.state.to_string().as_str()])),
                 Arc::new(StringArray::from(vec![memory.tier.to_string().as_str()])),
                 Arc::new(Float32Array::from(vec![memory.importance])),
@@ -333,7 +359,11 @@ impl LanceStore {
         let get_str_or = |name: &str, default: &str| -> String {
             batch
                 .column_by_name(name)
-                .and_then(|col| col.as_any().downcast_ref::<StringArray>().map(|a| a.value(row).to_string()))
+                .and_then(|col| {
+                    col.as_any()
+                        .downcast_ref::<StringArray>()
+                        .map(|a| a.value(row).to_string())
+                })
                 .unwrap_or_else(|| default.to_string())
         };
 
@@ -446,11 +476,13 @@ impl LanceStore {
         0.0
     }
 
+    /// Lists all memories that are neither deleted nor superseded.
+    /// Internal use; external lists should go through `list` or `list_filtered`.
     pub async fn list_all_active(&self) -> Result<Vec<Memory>, OmemError> {
         let table = self.open_table().await?;
         let batches: Vec<RecordBatch> = table
             .query()
-            .only_if("state != 'deleted'")
+            .only_if(DEFAULT_STATE_FILTER)
             .execute()
             .await
             .map_err(|e| OmemError::Storage(format!("list all query failed: {e}")))?
@@ -461,11 +493,7 @@ impl LanceStore {
         Self::batch_to_memories(&batches)
     }
 
-    pub async fn create(
-        &self,
-        memory: &Memory,
-        vector: Option<&[f32]>,
-    ) -> Result<(), OmemError> {
+    pub async fn create(&self, memory: &Memory, vector: Option<&[f32]>) -> Result<(), OmemError> {
         let batch = self.memory_to_batch(memory, vector)?;
         let table = self.open_table().await?;
         let reader = RecordBatchIterator::new(vec![Ok(batch)], self.schema());
@@ -512,8 +540,9 @@ impl LanceStore {
         let batches: Vec<RecordBatch> = table
             .query()
             .only_if(format!(
-                "id = '{}' AND state != 'deleted'",
-                escape_sql(id)
+                "id = '{}' AND {}",
+                escape_sql(id),
+                DEFAULT_STATE_FILTER
             ))
             .limit(1)
             .execute()
@@ -534,9 +563,7 @@ impl LanceStore {
         let fsl = col
             .as_any()
             .downcast_ref::<FixedSizeListArray>()
-            .ok_or_else(|| {
-                OmemError::Storage("vector column is not FixedSizeList".to_string())
-            })?;
+            .ok_or_else(|| OmemError::Storage("vector column is not FixedSizeList".to_string()))?;
         let inner = fsl.value(0);
         let float_arr = inner
             .as_any()
@@ -545,29 +572,123 @@ impl LanceStore {
         Ok(Some(float_arr.values().to_vec()))
     }
 
-    pub async fn update(
-        &self,
-        memory: &Memory,
-        vector: Option<&[f32]>,
-    ) -> Result<(), OmemError> {
+    pub async fn update(&self, memory: &Memory, vector: Option<&[f32]>) -> Result<(), OmemError> {
         // Auto-increment version on every update
         let mut mem = memory.clone();
         mem.version = Some(mem.version.unwrap_or(0) + 1);
         mem.updated_at = chrono::Utc::now().to_rfc3339();
 
-        let table = self.open_table().await?;
-        table
-            .delete(&format!("id = '{}'", escape_sql(&mem.id)))
-            .await
-            .map_err(|e| OmemError::Storage(format!("delete for update failed: {e}")))?;
+        // Preserve the existing embedding on metadata-only updates. When the
+        // caller passes `vector == None` (a state/tags/supersede change with no
+        // content edit), `memory_to_batch` writes a zero vector, which combined
+        // with `merge_insert.when_matched_update_all()` silently wipes the row's
+        // embedding and makes it invisible to vector search. Reuse the stored
+        // vector in that case.
+        let preserved: Option<Vec<f32>> = if vector.is_none() {
+            self.get_vector_by_id(&mem.id).await?
+        } else {
+            None
+        };
+        let vector = vector.or(preserved.as_deref());
 
+        let table = self.open_table().await?;
         let batch = self.memory_to_batch(&mem, vector)?;
         let reader = RecordBatchIterator::new(vec![Ok(batch)], self.schema());
-        table
-            .add(Box::new(reader) as Box<dyn arrow_array::RecordBatchReader + Send>)
-            .execute()
+
+        // Atomic upsert keyed on `id`: in a single committed transaction,
+        // replace the existing row (or insert it if it is somehow absent).
+        //
+        // This replaces a previous delete-then-add sequence, which was NOT
+        // atomic: if the operation was interrupted between the delete and the
+        // re-insert — e.g. the HTTP request was cancelled, so the handler
+        // future was dropped at the `.await` — the row was deleted but never
+        // restored, silently losing the memory. `merge_insert` commits as one
+        // transaction, so an interrupted update either fully applies or not at
+        // all; it can never leave the row deleted-without-replacement.
+        let mut merge = table.merge_insert(&["id"]);
+        merge.when_matched_update_all(None);
+        merge.when_not_matched_insert_all();
+        merge
+            .execute(Box::new(reader) as Box<dyn arrow_array::RecordBatchReader + Send>)
             .await
-            .map_err(|e| OmemError::Storage(format!("re-insert for update failed: {e}")))?;
+            .map_err(|e| OmemError::Storage(format!("merge-insert for update failed: {e}")))?;
+        Ok(())
+    }
+
+    /// Atomically replace `old_ids` with a new memory.
+    ///
+    /// Semantics:
+    /// 1. Validate that every old_id exists and is not already superseded.
+    ///    If any fail, return `Err(OmemError::Validation(...))` listing them;
+    ///    no writes happen.
+    /// 2. Insert the new memory (with its vector).
+    /// 3. For each old, set `state = Superseded`, `superseded_by = new.id`,
+    ///    `invalidated_at = now`.
+    ///
+    /// Lance has no native multi-row transactions, so step 3 is best-effort
+    /// sequential. If a per-old update fails, the new memory remains
+    /// (consolidated content is preserved) but the chain is partial — the
+    /// surfaced error names the IDs that failed so callers can retry.
+    pub async fn supersede_batch(
+        &self,
+        new: &Memory,
+        new_vector: Option<&[f32]>,
+        old_ids: &[String],
+    ) -> Result<(), OmemError> {
+        if old_ids.is_empty() {
+            return self.create(new, new_vector).await;
+        }
+
+        let mut missing = Vec::new();
+        let mut already = Vec::new();
+        let mut olds: Vec<Memory> = Vec::with_capacity(old_ids.len());
+        for id in old_ids {
+            match self.get_by_id(id).await? {
+                None => missing.push(id.clone()),
+                Some(m) => {
+                    if matches!(m.state, MemoryState::Superseded) {
+                        already.push(id.clone());
+                    } else {
+                        olds.push(m);
+                    }
+                }
+            }
+        }
+        if !missing.is_empty() || !already.is_empty() {
+            let mut parts = Vec::new();
+            if !missing.is_empty() {
+                parts.push(format!("missing: [{}]", missing.join(", ")));
+            }
+            if !already.is_empty() {
+                parts.push(format!("already superseded: [{}]", already.join(", ")));
+            }
+            return Err(OmemError::Validation(format!(
+                "supersede precheck failed — {}",
+                parts.join("; ")
+            )));
+        }
+
+        self.create(new, new_vector).await?;
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut update_failures = Vec::new();
+        for mut m in olds {
+            m.state = MemoryState::Superseded;
+            m.superseded_by = Some(new.id.clone());
+            m.invalidated_at = Some(now.clone());
+            m.updated_at = now.clone();
+            if let Err(e) = self.update(&m, None).await {
+                update_failures.push(format!("{}: {e}", m.id));
+            }
+        }
+        if !update_failures.is_empty() {
+            return Err(OmemError::Storage(format!(
+                "new memory {} created, but failed to mark superseded: [{}]",
+                new.id,
+                update_failures.join("; ")
+            )));
+        }
+
         Ok(())
     }
 
@@ -587,11 +708,12 @@ impl LanceStore {
         &self,
         limit: usize,
         offset: usize,
+        include_superseded: bool,
     ) -> Result<Vec<Memory>, OmemError> {
         let table = self.open_table().await?;
         let batches: Vec<RecordBatch> = table
             .query()
-            .only_if("state != 'deleted'")
+            .only_if(state_filter(include_superseded))
             .limit(limit + offset)
             .execute()
             .await
@@ -611,6 +733,7 @@ impl LanceStore {
         min_score: f32,
         scope_filter: Option<&str>,
         visibility_filter: Option<&str>,
+        include_superseded: bool,
     ) -> Result<Vec<(Memory, f32)>, OmemError> {
         let table = self.open_table().await?;
         let mut query = table
@@ -620,7 +743,7 @@ impl LanceStore {
 
         query = query.limit(limit);
 
-        let mut filter = "state != 'deleted'".to_string();
+        let mut filter = state_filter(include_superseded).to_string();
         if let Some(scope) = scope_filter {
             filter.push_str(&format!(" AND scope = '{}'", escape_sql(scope)));
         }
@@ -656,6 +779,7 @@ impl LanceStore {
         limit: usize,
         scope_filter: Option<&str>,
         visibility_filter: Option<&str>,
+        include_superseded: bool,
     ) -> Result<Vec<(Memory, f32)>, OmemError> {
         let table = self.open_table().await?;
 
@@ -667,7 +791,7 @@ impl LanceStore {
             .select(Select::All)
             .limit(limit);
 
-        let mut filter = "state != 'deleted'".to_string();
+        let mut filter = state_filter(include_superseded).to_string();
         if let Some(scope) = scope_filter {
             filter.push_str(&format!(" AND scope = '{}'", escape_sql(scope)));
         }
@@ -695,12 +819,8 @@ impl LanceStore {
         Ok(results)
     }
 
-    pub fn build_visibility_filter(
-        &self,
-        agent_id: &str,
-        accessible_spaces: &[String],
-    ) -> String {
-        let mut conditions = vec!["state != 'deleted'".to_string()];
+    pub fn build_visibility_filter(&self, agent_id: &str, accessible_spaces: &[String]) -> String {
+        let mut conditions = vec![DEFAULT_STATE_FILTER.to_string()];
 
         let mut vis_conditions = vec!["visibility = 'global'".to_string()];
 
@@ -744,7 +864,9 @@ impl LanceStore {
             .create_index(&["content"], Index::FTS(FtsIndexBuilder::default()))
             .execute()
             .await
-            .map_err(|e| OmemError::Storage(format!("failed to create FTS index on content: {e}")))?;
+            .map_err(|e| {
+                OmemError::Storage(format!("failed to create FTS index on content: {e}"))
+            })?;
         table
             .create_index(&["l0_abstract"], Index::FTS(FtsIndexBuilder::default()))
             .execute()
@@ -823,7 +945,8 @@ impl LanceStore {
         }
 
         let filter = format!(
-            "state != 'deleted' AND provenance_source_id = '{}'",
+            "{} AND provenance_source_id = '{}'",
+            DEFAULT_STATE_FILTER,
             escape_sql(source_memory_id)
         );
         let batches: Vec<RecordBatch> = table
@@ -841,7 +964,9 @@ impl LanceStore {
 
     pub async fn batch_soft_delete(&self, filter: &str) -> Result<usize, OmemError> {
         let table = self.open_table().await?;
-        let full_filter = format!("{} AND state != 'deleted'", filter);
+        // Allow batch deletion of already-superseded memories too (cleanup paths
+        // may want to garbage-collect old replaced fragments).
+        let full_filter = format!("{} AND {}", filter, STATE_FILTER_KEEPING_SUPERSEDED);
         let batches: Vec<RecordBatch> = table
             .query()
             .only_if(&full_filter)
@@ -863,7 +988,7 @@ impl LanceStore {
 
     pub async fn count_by_filter(&self, filter: &str) -> Result<usize, OmemError> {
         let table = self.open_table().await?;
-        let full_filter = format!("{} AND state != 'deleted'", filter);
+        let full_filter = format!("{} AND {}", filter, DEFAULT_STATE_FILTER);
         let count = table
             .count_rows(Some(full_filter))
             .await
@@ -885,7 +1010,7 @@ impl LanceStore {
 
         match &filter.state {
             Some(s) => conditions.push(format!("state = '{}'", escape_sql(s))),
-            None => conditions.push("state != 'deleted'".to_string()),
+            None => conditions.push(state_filter(filter.include_superseded).to_string()),
         }
 
         if let Some(ref cat) = filter.category {
@@ -900,10 +1025,7 @@ impl LanceStore {
         if let Some(ref tags) = filter.tags {
             for tag in tags {
                 let escaped = escape_sql(tag);
-                conditions.push(format!(
-                    "(tags LIKE '%\"{}\"%')",
-                    escaped
-                ));
+                conditions.push(format!("(tags LIKE '%\"{}\"%')", escaped));
             }
         }
 
@@ -942,6 +1064,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_metadata_only_update_preserves_vector() {
+        // Regression: a metadata-only update (caller passes vector = None) must
+        // NOT wipe the row's embedding. Previously `memory_to_batch` wrote a
+        // zero vector for the None case and `merge_insert.when_matched_update_all`
+        // committed it over the real embedding, making the memory invisible to
+        // vector search.
+        let (store, _dir) = setup().await;
+        let mut mem = make_memory("t-001", "memory with an embedding");
+        let mut v = vec![0.0f32; DEFAULT_VECTOR_DIM as usize];
+        v[0] = 0.5;
+        v[1] = 0.25;
+        store.create(&mem, Some(&v)).await.unwrap();
+
+        let stored = store
+            .get_vector_by_id(&mem.id)
+            .await
+            .unwrap()
+            .expect("vector present after create");
+        assert_eq!(stored, v);
+
+        // Metadata-only change: edit tags, request no re-embed (vector = None).
+        mem.tags = vec!["touched".to_string()];
+        store.update(&mem, None).await.unwrap();
+
+        let after = store
+            .get_vector_by_id(&mem.id)
+            .await
+            .unwrap()
+            .expect("vector present after metadata-only update");
+        assert_eq!(after, v, "metadata-only update wiped the embedding");
+        assert!(
+            after.iter().any(|&x| x != 0.0),
+            "embedding was zeroed by a metadata-only update"
+        );
+    }
+
+    #[tokio::test]
     async fn test_with_dim_stores_correct_dimension() {
         // 384 is a common smaller-model dim (e.g. all-MiniLM, bge-small).
         let dir = TempDir::new().expect("temp dir");
@@ -954,7 +1113,10 @@ mod tests {
         // Store + retrieve a memory with a 384-dim vector — should round-trip.
         let mem = make_memory("t-384", "tiny embedding test");
         let v = vec![0.1f32; 384];
-        store.create(&mem, Some(&v)).await.expect("create with 384-dim vector");
+        store
+            .create(&mem, Some(&v))
+            .await
+            .expect("create with 384-dim vector");
         let fetched = store.get_by_id(&mem.id).await.unwrap().expect("memory");
         assert_eq!(fetched.id, mem.id);
     }
@@ -969,7 +1131,10 @@ mod tests {
 
         let mem = make_memory("t-bad", "wrong-dim test");
         let v = vec![0.1f32; 768]; // wrong size for a 384-dim table
-        let err = store.create(&mem, Some(&v)).await.expect_err("should reject");
+        let err = store
+            .create(&mem, Some(&v))
+            .await
+            .expect_err("should reject");
         let msg = format!("{err:?}");
         assert!(msg.contains("does not match"), "unexpected error: {msg}");
     }
@@ -986,9 +1151,15 @@ mod tests {
         let store = LanceStore::with_dim(&uri, 1024)
             .await
             .expect("with_dim 1024");
-        let err = store.init_table().await.expect_err("dim mismatch should error");
+        let err = store
+            .init_table()
+            .await
+            .expect_err("dim mismatch should error");
         let msg = format!("{err:?}");
-        assert!(msg.contains("dim mismatch") || msg.contains("vector dim"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("dim mismatch") || msg.contains("vector dim"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -1038,7 +1209,7 @@ mod tests {
         query_vec[0] = 1.0;
 
         let results = store
-            .vector_search(&query_vec, 3, 0.0, None, None)
+            .vector_search(&query_vec, 3, 0.0, None, None, false)
             .await
             .unwrap();
 
@@ -1063,7 +1234,10 @@ mod tests {
 
         store.create_fts_index().await.unwrap();
 
-        let results = store.fts_search("programming language", 10, None, None).await.unwrap();
+        let results = store
+            .fts_search("programming language", 10, None, None, false)
+            .await
+            .unwrap();
 
         assert!(!results.is_empty());
         let contents: Vec<&str> = results.iter().map(|(m, _)| m.content.as_str()).collect();
@@ -1089,6 +1263,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_update_replaces_row_atomically() {
+        // Regression: update() used to delete-then-add, which could lose the
+        // row if interrupted between the two ops. It now upserts via
+        // merge_insert, so the row is always replaced in place — exactly one
+        // copy, never zero.
+        let (store, _dir) = setup().await;
+        let mem = make_memory("t-upd", "original content");
+        store.create(&mem, None).await.unwrap();
+        assert_eq!(store.list(100, 0, false).await.unwrap().len(), 1);
+
+        let mut fetched = store.get_by_id(&mem.id).await.unwrap().expect("created");
+        let v0 = fetched.version.unwrap_or(0);
+        fetched.content = "updated content".to_string();
+        fetched.l2_content = "updated content".to_string();
+        store.update(&fetched, None).await.unwrap();
+
+        // Exactly one row remains (no duplicate, no loss) with new content + bumped version.
+        let all = store.list(100, 0, false).await.unwrap();
+        assert_eq!(all.len(), 1, "update must not duplicate or drop the row");
+        let after = store
+            .get_by_id(&mem.id)
+            .await
+            .unwrap()
+            .expect("still present");
+        assert_eq!(after.content, "updated content");
+        assert!(after.version.unwrap_or(0) > v0, "version should increment");
+    }
+
+    #[tokio::test]
+    async fn test_update_upserts_when_row_absent() {
+        // merge_insert's when_not_matched_insert_all means update() inserts the
+        // row if it doesn't exist yet, rather than silently no-op'ing.
+        let (store, _dir) = setup().await;
+        let mem = make_memory("t-ups", "inserted via update");
+        store.update(&mem, None).await.unwrap();
+        let fetched = store.get_by_id(&mem.id).await.unwrap();
+        assert!(
+            fetched.is_some(),
+            "update should upsert when the row is absent"
+        );
+        assert_eq!(fetched.unwrap().content, "inserted via update");
+    }
+
+    #[tokio::test]
     async fn test_list_with_pagination() {
         let (store, _dir) = setup().await;
 
@@ -1097,13 +1315,13 @@ mod tests {
             store.create(&mem, None).await.unwrap();
         }
 
-        let page1 = store.list(2, 0).await.unwrap();
+        let page1 = store.list(2, 0, false).await.unwrap();
         assert_eq!(page1.len(), 2);
 
-        let page2 = store.list(2, 2).await.unwrap();
+        let page2 = store.list(2, 2, false).await.unwrap();
         assert_eq!(page2.len(), 2);
 
-        let page3 = store.list(2, 4).await.unwrap();
+        let page3 = store.list(2, 4, false).await.unwrap();
         assert_eq!(page3.len(), 1);
     }
 
@@ -1123,11 +1341,11 @@ mod tests {
         store_a.create(&mem_a, Some(&va)).await.unwrap();
         store_b.create(&mem_b, Some(&vb)).await.unwrap();
 
-        let list_a = store_a.list(100, 0).await.unwrap();
+        let list_a = store_a.list(100, 0, false).await.unwrap();
         assert_eq!(list_a.len(), 1);
         assert_eq!(list_a[0].tenant_id, "tenant_A");
 
-        let list_b = store_b.list(100, 0).await.unwrap();
+        let list_b = store_b.list(100, 0, false).await.unwrap();
         assert_eq!(list_b.len(), 1);
         assert_eq!(list_b[0].tenant_id, "tenant_B");
     }
@@ -1136,9 +1354,24 @@ mod tests {
     async fn test_list_filtered_by_category() {
         let (store, _dir) = setup().await;
 
-        let m1 = Memory::new("dark mode pref", Category::Preferences, MemoryType::Insight, "t-001");
-        let m2 = Memory::new("another pref", Category::Preferences, MemoryType::Insight, "t-001");
-        let m3 = Memory::new("meeting happened", Category::Events, MemoryType::Session, "t-001");
+        let m1 = Memory::new(
+            "dark mode pref",
+            Category::Preferences,
+            MemoryType::Insight,
+            "t-001",
+        );
+        let m2 = Memory::new(
+            "another pref",
+            Category::Preferences,
+            MemoryType::Insight,
+            "t-001",
+        );
+        let m3 = Memory::new(
+            "meeting happened",
+            Category::Events,
+            MemoryType::Session,
+            "t-001",
+        );
 
         store.create(&m1, None).await.unwrap();
         store.create(&m2, None).await.unwrap();
@@ -1235,7 +1468,7 @@ mod tests {
         });
         let result = store.build_visibility_filter("", &[]);
         assert!(result.contains("visibility = 'global'"));
-        assert!(result.contains("state != 'deleted'"));
+        assert!(result.contains("state NOT IN ('deleted', 'superseded')"));
         assert!(!result.contains("private"));
     }
 
@@ -1278,12 +1511,11 @@ mod tests {
     #[tokio::test]
     async fn test_schema_evolution_adds_missing_columns() {
         let dir = TempDir::new().unwrap();
-        let store = LanceStore::new(dir.path().to_str().unwrap())
-            .await
-            .unwrap();
+        let store = LanceStore::new(dir.path().to_str().unwrap()).await.unwrap();
 
         let old_schema = Arc::new(Schema::new(
-            store.schema()
+            store
+                .schema()
                 .fields()
                 .iter()
                 .filter(|f| f.name() != "version" && f.name() != "provenance_source_id")
@@ -1302,7 +1534,9 @@ mod tests {
         let table_before = store.open_table().await.unwrap();
         let schema_before = table_before.schema().await.unwrap();
         assert!(schema_before.field_with_name("version").is_err());
-        assert!(schema_before.field_with_name("provenance_source_id").is_err());
+        assert!(schema_before
+            .field_with_name("provenance_source_id")
+            .is_err());
 
         store.init_table().await.unwrap();
 
@@ -1316,9 +1550,7 @@ mod tests {
     #[tokio::test]
     async fn test_init_table_idempotent() {
         let dir = TempDir::new().unwrap();
-        let store = LanceStore::new(dir.path().to_str().unwrap())
-            .await
-            .unwrap();
+        let store = LanceStore::new(dir.path().to_str().unwrap()).await.unwrap();
 
         store.init_table().await.unwrap();
 
@@ -1336,12 +1568,11 @@ mod tests {
     #[tokio::test]
     async fn test_find_by_provenance_source_missing_column() {
         let dir = TempDir::new().unwrap();
-        let store = LanceStore::new(dir.path().to_str().unwrap())
-            .await
-            .unwrap();
+        let store = LanceStore::new(dir.path().to_str().unwrap()).await.unwrap();
 
         let old_schema = Arc::new(Schema::new(
-            store.schema()
+            store
+                .schema()
                 .fields()
                 .iter()
                 .filter(|f| f.name() != "provenance_source_id")
@@ -1355,10 +1586,139 @@ mod tests {
             .await
             .unwrap();
 
-        let result = store
-            .find_by_provenance_source("some-id")
+        let result = store.find_by_provenance_source("some-id").await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_supersede_batch_marks_old_as_superseded() {
+        let (store, _dir) = setup().await;
+        let v = vec![0.1f32; DEFAULT_VECTOR_DIM as usize];
+
+        let old1 = make_memory("t-001", "fragment 1 of 3");
+        let old2 = make_memory("t-001", "fragment 2 of 3");
+        let old3 = make_memory("t-001", "fragment 3 of 3");
+        store.create(&old1, Some(&v)).await.unwrap();
+        store.create(&old2, Some(&v)).await.unwrap();
+        store.create(&old3, Some(&v)).await.unwrap();
+
+        let new = make_memory("t-001", "consolidated content");
+        let old_ids = vec![old1.id.clone(), old2.id.clone(), old3.id.clone()];
+        store
+            .supersede_batch(&new, Some(&v), &old_ids)
+            .await
+            .expect("supersede should succeed");
+
+        for id in &old_ids {
+            let fetched = store
+                .get_by_id(id)
+                .await
+                .unwrap()
+                .expect("old still exists");
+            assert!(matches!(fetched.state, MemoryState::Superseded));
+            assert_eq!(fetched.superseded_by.as_deref(), Some(new.id.as_str()));
+            assert!(fetched.invalidated_at.is_some());
+        }
+
+        let new_fetched = store.get_by_id(&new.id).await.unwrap().expect("new exists");
+        assert!(matches!(new_fetched.state, MemoryState::Active));
+    }
+
+    #[tokio::test]
+    async fn test_supersede_batch_rejects_missing_id() {
+        let (store, _dir) = setup().await;
+        let v = vec![0.1f32; DEFAULT_VECTOR_DIM as usize];
+
+        let real = make_memory("t-001", "existing memory");
+        store.create(&real, Some(&v)).await.unwrap();
+
+        let new = make_memory("t-001", "consolidated");
+        let old_ids = vec![real.id.clone(), "ghost-id-does-not-exist".to_string()];
+        let err = store
+            .supersede_batch(&new, Some(&v), &old_ids)
+            .await
+            .expect_err("missing id should reject");
+
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("missing"),
+            "error should mention missing: {msg}"
+        );
+        assert!(
+            msg.contains("ghost-id-does-not-exist"),
+            "error should list the ghost id: {msg}"
+        );
+
+        // No write happened — original memory unchanged, new memory not created.
+        let fetched = store
+            .get_by_id(&real.id)
+            .await
+            .unwrap()
+            .expect("still there");
+        assert!(matches!(fetched.state, MemoryState::Active));
+        assert!(store.get_by_id(&new.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_supersede_batch_rejects_already_superseded() {
+        let (store, _dir) = setup().await;
+        let v = vec![0.1f32; DEFAULT_VECTOR_DIM as usize];
+
+        let old = make_memory("t-001", "original");
+        store.create(&old, Some(&v)).await.unwrap();
+        let first_new = make_memory("t-001", "first consolidation");
+        store
+            .supersede_batch(&first_new, Some(&v), &[old.id.clone()])
             .await
             .unwrap();
-        assert!(result.is_empty());
+
+        // Trying to supersede `old` again should reject.
+        let second_new = make_memory("t-001", "second attempt");
+        let err = store
+            .supersede_batch(&second_new, Some(&v), &[old.id.clone()])
+            .await
+            .expect_err("already-superseded should reject");
+
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("already superseded"),
+            "error should mention already-superseded: {msg}"
+        );
+        assert!(
+            store.get_by_id(&second_new.id).await.unwrap().is_none(),
+            "second_new should NOT have been created"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_default_state_filter_excludes_superseded() {
+        let (store, _dir) = setup().await;
+        let v = vec![0.1f32; DEFAULT_VECTOR_DIM as usize];
+
+        let old = make_memory("t-001", "to be superseded");
+        let alive = make_memory("t-001", "still active");
+        store.create(&old, Some(&v)).await.unwrap();
+        store.create(&alive, Some(&v)).await.unwrap();
+        let new = make_memory("t-001", "replacement");
+        store
+            .supersede_batch(&new, Some(&v), &[old.id.clone()])
+            .await
+            .unwrap();
+
+        // Default list excludes the superseded `old`.
+        let listed = store.list(100, 0, false).await.unwrap();
+        let ids: Vec<&str> = listed.iter().map(|m| m.id.as_str()).collect();
+        assert!(!ids.contains(&old.id.as_str()), "old should be hidden");
+        assert!(ids.contains(&alive.id.as_str()));
+        assert!(ids.contains(&new.id.as_str()));
+
+        // include_superseded=true surfaces it.
+        let listed_with = store.list(100, 0, true).await.unwrap();
+        let ids_with: Vec<&str> = listed_with.iter().map(|m| m.id.as_str()).collect();
+        assert!(ids_with.contains(&old.id.as_str()));
+
+        // get_by_id always returns regardless of state (history preserved).
+        let direct = store.get_by_id(&old.id).await.unwrap();
+        assert!(direct.is_some(), "get_by_id should still return superseded");
     }
 }

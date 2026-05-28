@@ -9,8 +9,8 @@ use omem_server::llm::{create_llm_service, LlmService};
 use omem_server::store::{SpaceStore, StoreManager, TenantStore};
 
 fn init_tracing(config: &OmemConfig) {
-    let filter = EnvFilter::try_from_env("RUST_LOG")
-        .unwrap_or_else(|_| EnvFilter::new(&config.log_level));
+    let filter =
+        EnvFilter::try_from_env("RUST_LOG").unwrap_or_else(|_| EnvFilter::new(&config.log_level));
 
     fmt()
         .json()
@@ -45,7 +45,10 @@ async fn main() {
             .await
             .expect("failed to create embed service"),
     );
-    let vector_dim: i32 = embed.dimensions().try_into().expect("embedding dim does not fit in i32");
+    let vector_dim: i32 = embed
+        .dimensions()
+        .try_into()
+        .expect("embedding dim does not fit in i32");
     tracing::info!(vector_dim, "embedder reported vector dimension");
 
     let store_manager = Arc::new(StoreManager::with_vector_dim(&base_uri, vector_dim));
@@ -56,14 +59,20 @@ async fn main() {
             .await
             .expect("failed to create TenantStore"),
     );
-    tenant_store.init_table().await.expect("failed to init tenants table");
+    tenant_store
+        .init_table()
+        .await
+        .expect("failed to init tenants table");
 
     let space_store = Arc::new(
         SpaceStore::new(&system_uri)
             .await
             .expect("failed to create SpaceStore"),
     );
-    space_store.init_tables().await.expect("failed to init spaces tables");
+    space_store
+        .init_tables()
+        .await
+        .expect("failed to init spaces tables");
 
     let llm: Arc<dyn LlmService> = Arc::from(
         create_llm_service(&config)
@@ -80,6 +89,9 @@ async fn main() {
         config: config.clone(),
         import_semaphore: Arc::new(tokio::sync::Semaphore::new(3)),
         reconcile_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+        share_rate_limiter: Arc::new(omem_server::api::rate_limit::RateLimiter::new(
+            config.share_rate_per_min,
+        )),
     });
 
     let app = build_router(state);

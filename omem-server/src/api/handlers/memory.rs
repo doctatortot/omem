@@ -6,7 +6,7 @@ use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use crate::api::server::{AppState, personal_space_id};
+use crate::api::server::{personal_space_id, AppState};
 use crate::domain::category::Category;
 use crate::domain::error::OmemError;
 use crate::domain::memory::Memory;
@@ -19,6 +19,29 @@ use crate::retrieve::pipeline::SearchRequest;
 use crate::retrieve::RetrievalPipeline;
 use crate::store::lancedb::ListFilter;
 use crate::store::StoreManager;
+
+/// Map an embedder failure to a structured error.
+///
+/// An over-context-window failure is a client-input problem (the content is
+/// too long for the configured embedder), so surface it as `ContentTooLong`
+/// (HTTP 413) rather than a generic 500 with the cause buried in a stringified
+/// upstream error. Any other embed failure stays `Embedding` (500).
+fn map_embed_error(content_len: usize, e: impl std::fmt::Display) -> OmemError {
+    let lc = e.to_string().to_lowercase();
+    if lc.contains("context window")
+        || lc.contains("context length")
+        || lc.contains("input length exceeds")
+        || lc.contains("maximum context")
+    {
+        OmemError::ContentTooLong {
+            length: content_len,
+            hint: "split the content into smaller memories or configure a longer-context embedder"
+                .to_string(),
+        }
+    } else {
+        OmemError::Embedding(format!("failed to embed content: {e}"))
+    }
+}
 
 // ── Request / Response DTOs ──────────────────────────────────────────
 
@@ -37,6 +60,12 @@ pub struct CreateMemoryBody {
     #[serde(default)]
     pub tags: Option<Vec<String>>,
     pub source: Option<String>,
+    pub memory_type: Option<String>,
+    /// IDs of memories to mark superseded by this one. Used when consolidating
+    /// fragmented memories (e.g., chunked old-embedder content) into a single
+    /// new memory in one atomic call.
+    #[serde(default)]
+    pub replaces: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -60,6 +89,8 @@ pub struct SearchQuery {
     pub agent_id: Option<String>,
     #[serde(default)]
     pub check_stale: bool,
+    #[serde(default)]
+    pub include_superseded: bool,
 }
 
 fn default_limit() -> usize {
@@ -81,6 +112,8 @@ pub struct ListQuery {
     pub sort: String,
     #[serde(default = "default_order")]
     pub order: String,
+    #[serde(default)]
+    pub include_superseded: bool,
 }
 
 fn default_sort() -> String {
@@ -95,6 +128,7 @@ pub struct UpdateMemoryBody {
     pub content: Option<String>,
     pub tags: Option<Vec<String>>,
     pub state: Option<String>,
+    pub memory_type: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -140,13 +174,16 @@ pub struct ListResponseDto {
 ///
 /// Two modes:
 /// - If `messages` present → ingest pipeline (async), returns 202
-/// - If `content` present → create single pinned memory, returns 201
+/// - If `content` present → create single insight memory, returns 201
 pub async fn create_memory(
     State(state): State<Arc<AppState>>,
     Extension(auth): Extension<AuthInfo>,
     Json(body): Json<CreateMemoryBody>,
 ) -> Result<impl IntoResponse, OmemError> {
-    let store = state.store_manager.get_store(&personal_space_id(&auth.tenant_id)).await?;
+    let store = state
+        .store_manager
+        .get_store(&personal_space_id(&auth.tenant_id))
+        .await?;
 
     if let Some(messages) = body.messages {
         if messages.is_empty() {
@@ -158,7 +195,11 @@ pub async fn create_memory(
             _ => IngestMode::Smart,
         };
 
-        let session_uri = format!("{}/{}", state.config.store_uri(), personal_space_id(&auth.tenant_id));
+        let session_uri = format!(
+            "{}/{}",
+            state.config.store_uri(),
+            personal_space_id(&auth.tenant_id)
+        );
 
         let request = IngestRequest {
             messages: messages
@@ -182,45 +223,54 @@ pub async fn create_memory(
         );
         session_store.init_table().await?;
 
-        let ingest_pipeline = IngestPipeline::new(
-            store,
-            session_store,
-            state.embed.clone(),
-            state.llm.clone(),
-        );
+        let ingest_pipeline =
+            IngestPipeline::new(store, session_store, state.embed.clone(), state.llm.clone());
 
         let response = ingest_pipeline.ingest(request).await?;
         return Ok((StatusCode::ACCEPTED, Json(serde_json::json!(response))).into_response());
     }
 
-    let content = body
-        .content
-        .ok_or_else(|| OmemError::Validation("either 'messages' or 'content' required".to_string()))?;
+    let content = body.content.ok_or_else(|| {
+        OmemError::Validation("either 'messages' or 'content' required".to_string())
+    })?;
 
     if content.is_empty() {
         return Err(OmemError::Validation("content cannot be empty".to_string()));
     }
 
+    let memory_type = match body.memory_type {
+        Some(s) => s.parse().map_err(OmemError::Validation)?,
+        None => MemoryType::Insight,
+    };
+
     let mut memory = Memory::new(
         &content,
         Category::Preferences,
-        MemoryType::Pinned,
+        memory_type,
         &auth.tenant_id,
     );
     memory.tags = body.tags.unwrap_or_default();
     memory.source = body.source;
     memory.agent_id = auth.agent_id;
 
+    let content_len = content.chars().count();
     let vectors = state
         .embed
         .embed(&[content])
         .await
-        .map_err(|e| OmemError::Embedding(format!("failed to embed content: {e}")))?;
+        .map_err(|e| map_embed_error(content_len, e))?;
     let vector = vectors.into_iter().next();
 
-    store
-        .create(&memory, vector.as_deref())
-        .await?;
+    match body.replaces.as_deref() {
+        Some(ids) if !ids.is_empty() => {
+            store
+                .supersede_batch(&memory, vector.as_deref(), ids)
+                .await?;
+        }
+        _ => {
+            store.create(&memory, vector.as_deref()).await?;
+        }
+    }
 
     // Fire-and-forget: check auto-share rules for the newly created memory
     {
@@ -258,7 +308,9 @@ pub async fn search_memories(
     Query(params): Query<SearchQuery>,
 ) -> Result<Json<SearchResponseDto>, OmemError> {
     if params.q.is_empty() {
-        return Err(OmemError::Validation("query parameter 'q' is required".to_string()));
+        return Err(OmemError::Validation(
+            "query parameter 'q' is required".to_string(),
+        ));
     }
 
     let vectors = state
@@ -274,7 +326,10 @@ pub async fn search_memories(
         .await?;
 
     if spaces.is_empty() {
-        let store = state.store_manager.get_store(&personal_space_id(&auth.tenant_id)).await?;
+        let store = state
+            .store_manager
+            .get_store(&personal_space_id(&auth.tenant_id))
+            .await?;
 
         let request = SearchRequest {
             query: params.q,
@@ -284,9 +339,13 @@ pub async fn search_memories(
             limit: Some(params.limit),
             min_score: params.min_score,
             include_trace: params.include_trace,
-            tags_filter: params.tags.as_ref().map(|t| t.split(',').map(|s| s.trim().to_string()).collect()),
+            tags_filter: params
+                .tags
+                .as_ref()
+                .map(|t| t.split(',').map(|s| s.trim().to_string()).collect()),
             source_filter: params.source.clone(),
             agent_id_filter: params.agent_id.clone(),
+            include_superseded: params.include_superseded,
         };
 
         let retrieval_pipeline = RetrievalPipeline::new(store);
@@ -304,7 +363,8 @@ pub async fn search_memories(
 
         if params.check_stale {
             for result in &mut results {
-                result.stale_info = check_stale_for_memory(&result.memory, &state.store_manager).await;
+                result.stale_info =
+                    check_stale_for_memory(&result.memory, &state.store_manager).await;
             }
         }
 
@@ -341,10 +401,13 @@ pub async fn search_memories(
         let limit = params.limit;
         let min_score = params.min_score;
         let tags_filter = params.tags.as_ref().map(|t| {
-            t.split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>()
+            t.split(',')
+                .map(|s| s.trim().to_string())
+                .collect::<Vec<_>>()
         });
         let source_filter = params.source.clone();
         let agent_id_filter = params.agent_id.clone();
+        let include_superseded = params.include_superseded;
         let store = acc.store.clone();
         let space_id = acc.space_id.clone();
         let weight = acc.weight;
@@ -361,6 +424,7 @@ pub async fn search_memories(
                 tags_filter,
                 source_filter,
                 agent_id_filter,
+                include_superseded,
             };
             let pipeline = RetrievalPipeline::new(store);
             let result = pipeline.search(&request).await;
@@ -402,7 +466,11 @@ pub async fn search_memories(
 
     let mut results: Vec<SearchResultDto> = all_results
         .into_iter()
-        .map(|(memory, score, _space_id)| SearchResultDto { memory, score, stale_info: None })
+        .map(|(memory, score, _space_id)| SearchResultDto {
+            memory,
+            score,
+            stale_info: None,
+        })
         .collect();
 
     if params.check_stale {
@@ -417,7 +485,10 @@ pub async fn search_memories(
     }))
 }
 
-fn build_trace(include: bool, trace: &crate::retrieve::trace::RetrievalTrace) -> Option<serde_json::Value> {
+fn build_trace(
+    include: bool,
+    trace: &crate::retrieve::trace::RetrievalTrace,
+) -> Option<serde_json::Value> {
     if !include {
         return None;
     }
@@ -436,7 +507,10 @@ fn build_trace(include: bool, trace: &crate::retrieve::trace::RetrievalTrace) ->
     }))
 }
 
-pub(crate) async fn check_stale_for_memory(memory: &Memory, store_manager: &StoreManager) -> Option<StaleInfo> {
+pub(crate) async fn check_stale_for_memory(
+    memory: &Memory,
+    store_manager: &StoreManager,
+) -> Option<StaleInfo> {
     let provenance = memory.provenance.as_ref()?;
 
     let source_store = store_manager
@@ -472,11 +546,33 @@ pub async fn get_memory(
     Path(id): Path<String>,
     Query(params): Query<GetMemoryQuery>,
 ) -> Result<Json<serde_json::Value>, OmemError> {
-    let store = state.store_manager.get_store(&personal_space_id(&auth.tenant_id)).await?;
-    let memory = store
+    let store = state
+        .store_manager
+        .get_store(&personal_space_id(&auth.tenant_id))
+        .await?;
+    let mut memory = store
         .get_by_id(&id)
         .await?
         .ok_or_else(|| OmemError::NotFound(format!("memory {id}")))?;
+
+    if state.config.auto_refresh_shares && memory.provenance.is_some() {
+        if let Some(info) = check_stale_for_memory(&memory, &state.store_manager).await {
+            if info.is_stale && !info.source_deleted {
+                let agent_id = auth.agent_id.as_deref().unwrap_or("");
+                if let Ok(fresh) = super::sharing::refresh_shared_copy(
+                    &state.store_manager,
+                    &state.space_store,
+                    &memory,
+                    &auth.tenant_id,
+                    agent_id,
+                )
+                .await
+                {
+                    memory = fresh;
+                }
+            }
+        }
+    }
 
     let mut response = serde_json::to_value(&memory)
         .map_err(|e| OmemError::Internal(format!("serialize failed: {e}")))?;
@@ -498,7 +594,10 @@ pub async fn update_memory(
     Path(id): Path<String>,
     Json(body): Json<UpdateMemoryBody>,
 ) -> Result<Json<Memory>, OmemError> {
-    let store = state.store_manager.get_store(&personal_space_id(&auth.tenant_id)).await?;
+    let store = state
+        .store_manager
+        .get_store(&personal_space_id(&auth.tenant_id))
+        .await?;
     let mut memory = store
         .get_by_id(&id)
         .await?
@@ -525,14 +624,21 @@ pub async fn update_memory(
             .map_err(|e: String| OmemError::Validation(e))?;
     }
 
+    if let Some(memory_type_str) = body.memory_type {
+        memory.memory_type = memory_type_str
+            .parse()
+            .map_err(|e: String| OmemError::Validation(e))?;
+    }
+
     memory.updated_at = chrono::Utc::now().to_rfc3339();
 
     let vector = if need_reembed {
+        let content_len = memory.content.chars().count();
         let vectors = state
             .embed
             .embed(&[memory.content.clone()])
             .await
-            .map_err(|e| OmemError::Embedding(format!("failed to embed content: {e}")))?;
+            .map_err(|e| map_embed_error(content_len, e))?;
         vectors.into_iter().next()
     } else {
         None
@@ -549,7 +655,10 @@ pub async fn delete_memory(
     Extension(auth): Extension<AuthInfo>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, OmemError> {
-    let store = state.store_manager.get_store(&personal_space_id(&auth.tenant_id)).await?;
+    let store = state
+        .store_manager
+        .get_store(&personal_space_id(&auth.tenant_id))
+        .await?;
     store
         .get_by_id(&id)
         .await?
@@ -566,7 +675,10 @@ pub async fn list_memories(
     Extension(auth): Extension<AuthInfo>,
     Query(params): Query<ListQuery>,
 ) -> Result<Json<ListResponseDto>, OmemError> {
-    let store = state.store_manager.get_store(&personal_space_id(&auth.tenant_id)).await?;
+    let store = state
+        .store_manager
+        .get_store(&personal_space_id(&auth.tenant_id))
+        .await?;
 
     let filter = ListFilter {
         category: params.category,
@@ -576,6 +688,7 @@ pub async fn list_memories(
             .map(|t| t.split(',').map(|s| s.trim().to_string()).collect()),
         memory_type: params.memory_type,
         state: params.state,
+        include_superseded: params.include_superseded,
         sort: params.sort,
         order: params.order,
     };
@@ -617,10 +730,7 @@ fn build_batch_delete_where(filter: &BatchDeleteFilter) -> String {
     let mut conditions = Vec::new();
 
     if let Some(ref source) = filter.source {
-        conditions.push(format!(
-            "source LIKE '{}%'",
-            source.replace('\'', "''")
-        ));
+        conditions.push(format!("source LIKE '{}%'", source.replace('\'', "''")));
     }
     if let Some(ref tags) = filter.tags {
         for tag in tags {
@@ -712,7 +822,11 @@ pub async fn delete_all_memories(
         .await?;
     let count = store.delete_all().await?;
 
-    let session_uri = format!("{}/{}", state.config.store_uri(), personal_space_id(&auth.tenant_id));
+    let session_uri = format!(
+        "{}/{}",
+        state.config.store_uri(),
+        personal_space_id(&auth.tenant_id)
+    );
     let session_store = SessionStore::new(&session_uri)
         .await
         .map_err(|e| OmemError::Storage(format!("session store: {e}")))?;

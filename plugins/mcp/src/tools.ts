@@ -8,7 +8,7 @@ export function registerTools(server: McpServer, client: OmemClient): void {
     {
       title: "Store Memory",
       description:
-        "Store a new memory in omem. Use this to save important information, decisions, preferences, or context for future reference.",
+        "Store a new memory in omem. Use this to save important information, decisions, preferences, or context for future reference. Pass `replaces` to atomically supersede one or more existing memories with this new consolidated one (e.g. when merging chunked fragments into a single record).",
       inputSchema: {
         content: z.string().describe("The content to remember"),
         tags: z
@@ -19,14 +19,21 @@ export function registerTools(server: McpServer, client: OmemClient): void {
           .string()
           .optional()
           .describe("Source identifier (e.g. 'chat', 'code-review')"),
+        replaces: z
+          .array(z.string())
+          .optional()
+          .describe(
+            "Memory IDs to mark as superseded by this new one. Use when consolidating multiple fragments into a single memory. Default search hides superseded entries; get-by-id still returns them for history.",
+          ),
       },
     },
-    async ({ content, tags, source }) => {
+    async ({ content, tags, source, replaces }) => {
       try {
         const memory = await client.createMemory(
           content,
           tags ?? [],
           source ?? "mcp",
+          replaces,
         );
         return {
           content: [
@@ -55,7 +62,7 @@ export function registerTools(server: McpServer, client: OmemClient): void {
     {
       title: "Search Memories",
       description:
-        "Search stored memories by semantic query. Returns the most relevant memories ranked by similarity.",
+        "Search stored memories by semantic query. Returns the most relevant memories ranked by similarity. By default searches across all spaces the caller has access to (personal + team + organization). Pass `space` to restrict to specific spaces — useful when you want a query scoped to one context (e.g. work-only) or to peek into a non-default space (e.g. 'this question is about something in our team space').",
       inputSchema: {
         query: z.string().describe("Search query"),
         limit: z
@@ -73,15 +80,22 @@ export function registerTools(server: McpServer, client: OmemClient): void {
           .array(z.string())
           .optional()
           .describe("Filter by tags"),
+        space: z
+          .string()
+          .optional()
+          .describe(
+            "Restrict search to specific spaces. Comma-separated space IDs (e.g. 'personal:doc,team:synchresis-work'), a single ID, or 'all' for every accessible space. Omitted = all accessible spaces.",
+          ),
       },
     },
-    async ({ query, limit, scope, tags }) => {
+    async ({ query, limit, scope, tags, space }) => {
       try {
         const results = await client.searchMemories(
           query,
           limit ?? 10,
           scope,
           tags,
+          space,
         );
 
         if (results.length === 0) {

@@ -112,8 +112,8 @@ pub async fn create_import(
     }
 
     let data = file_data.ok_or_else(|| OmemError::Validation("no 'file' field".to_string()))?;
-    let content =
-        String::from_utf8(data).map_err(|_| OmemError::Validation("not valid UTF-8".to_string()))?;
+    let content = String::from_utf8(data)
+        .map_err(|_| OmemError::Validation("not valid UTF-8".to_string()))?;
 
     let valid_types = ["memory", "session", "markdown", "jsonl"];
     if !valid_types.contains(&file_type.as_str()) {
@@ -365,7 +365,9 @@ pub async fn cross_reconcile(
         };
 
         // limit=6 to account for self appearing in results
-        let similar = store.vector_search(query_vec, 6, 0.85, None, None).await?;
+        let similar = store
+            .vector_search(query_vec, 6, 0.85, None, None, false)
+            .await?;
 
         for (candidate, score) in &similar {
             if candidate.id == memory.id {
