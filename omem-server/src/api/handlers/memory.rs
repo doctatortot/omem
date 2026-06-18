@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Extension, Path, Query, State};
@@ -17,6 +18,7 @@ use crate::ingest::IngestPipeline;
 use crate::ingest::SessionStore;
 use crate::retrieve::pipeline::SearchRequest;
 use crate::retrieve::RetrievalPipeline;
+use crate::store::lancedb::LanceStore;
 use crate::store::lancedb::ListFilter;
 use crate::store::StoreManager;
 
@@ -348,7 +350,7 @@ pub async fn search_memories(
             include_superseded: params.include_superseded,
         };
 
-        let retrieval_pipeline = RetrievalPipeline::new(store);
+        let retrieval_pipeline = RetrievalPipeline::new(Arc::clone(&store));
         let search_results = retrieval_pipeline.search(&request).await?;
 
         let mut results: Vec<SearchResultDto> = search_results
@@ -367,6 +369,8 @@ pub async fn search_memories(
                     check_stale_for_memory(&result.memory, &state.store_manager).await;
             }
         }
+
+        spawn_record_access(&store, &results);
 
         let trace = build_trace(params.include_trace, &search_results.trace);
         return Ok(Json(SearchResponseDto { results, trace }));
@@ -464,6 +468,15 @@ pub async fn search_memories(
     all_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     all_results.truncate(params.limit);
 
+    // Group returned memory IDs by space so we can bump access counts.
+    let mut ids_by_space: HashMap<String, Vec<String>> = HashMap::new();
+    for (memory, _, space_id) in &all_results {
+        ids_by_space
+            .entry(space_id.clone())
+            .or_default()
+            .push(memory.id.clone());
+    }
+
     let mut results: Vec<SearchResultDto> = all_results
         .into_iter()
         .map(|(memory, score, _space_id)| SearchResultDto {
@@ -479,10 +492,49 @@ pub async fn search_memories(
         }
     }
 
+    spawn_record_access_multi(&state.store_manager, ids_by_space);
+
     Ok(Json(SearchResponseDto {
         results,
         trace: None,
     }))
+}
+
+fn spawn_record_access(store: &Arc<LanceStore>, results: &[SearchResultDto]) {
+    if results.is_empty() {
+        return;
+    }
+    let ids: Vec<String> = results.iter().map(|r| r.memory.id.clone()).collect();
+    let store = Arc::clone(store);
+    tokio::spawn(async move {
+        if let Err(e) = store.record_access(&ids).await {
+            tracing::warn!(error = %e, "failed to record search access counts");
+        }
+    });
+}
+
+fn spawn_record_access_multi(
+    store_manager: &Arc<StoreManager>,
+    ids_by_space: HashMap<String, Vec<String>>,
+) {
+    if ids_by_space.is_empty() {
+        return;
+    }
+    let mgr = Arc::clone(store_manager);
+    tokio::spawn(async move {
+        for (space_id, ids) in ids_by_space {
+            match mgr.get_store(&space_id).await {
+                Ok(store) => {
+                    if let Err(e) = store.record_access(&ids).await {
+                        tracing::warn!(space_id = %space_id, error = %e, "failed to record access counts");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(space_id = %space_id, error = %e, "failed to get store for access recording");
+                }
+            }
+        }
+    });
 }
 
 fn build_trace(

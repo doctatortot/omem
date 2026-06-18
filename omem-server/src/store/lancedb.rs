@@ -692,6 +692,35 @@ impl LanceStore {
         Ok(())
     }
 
+    /// Lightweight bump of `access_count` and `last_accessed_at` for memories
+    /// returned by a search.  Uses a SQL-style column update so it never
+    /// touches the vector column or re-serialises the full row.
+    pub async fn record_access(&self, ids: &[String]) -> Result<(), OmemError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+
+        let table = self.open_table().await?;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let in_list: String = ids
+            .iter()
+            .map(|id| format!("'{}'", escape_sql(id)))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        table
+            .update()
+            .only_if(format!("id IN ({in_list})"))
+            .column("access_count", "access_count + 1")
+            .column("last_accessed_at", format!("'{now}'"))
+            .execute()
+            .await
+            .map_err(|e| OmemError::Storage(format!("record_access failed: {e}")))?;
+
+        Ok(())
+    }
+
     pub async fn soft_delete(&self, id: &str) -> Result<(), OmemError> {
         let memory = self
             .get_by_id(id)
@@ -1720,5 +1749,42 @@ mod tests {
         // get_by_id always returns regardless of state (history preserved).
         let direct = store.get_by_id(&old.id).await.unwrap();
         assert!(direct.is_some(), "get_by_id should still return superseded");
+    }
+
+    #[tokio::test]
+    async fn test_record_access_bumps_count_and_timestamp() {
+        let (store, _dir) = setup().await;
+        let mem = make_memory("t-access", "test access tracking");
+        store.create(&mem, None).await.unwrap();
+
+        let before = store.get_by_id(&mem.id).await.unwrap().unwrap();
+        assert_eq!(before.access_count, 0);
+        assert!(before.last_accessed_at.is_none());
+
+        store
+            .record_access(&[mem.id.clone()])
+            .await
+            .unwrap();
+
+        let after = store.get_by_id(&mem.id).await.unwrap().unwrap();
+        assert_eq!(after.access_count, 1, "access_count should be 1");
+        assert!(
+            after.last_accessed_at.is_some(),
+            "last_accessed_at should be set"
+        );
+
+        store
+            .record_access(&[mem.id.clone()])
+            .await
+            .unwrap();
+
+        let after2 = store.get_by_id(&mem.id).await.unwrap().unwrap();
+        assert_eq!(after2.access_count, 2, "access_count should be 2");
+    }
+
+    #[tokio::test]
+    async fn test_record_access_empty_ids_is_noop() {
+        let (store, _dir) = setup().await;
+        store.record_access(&[]).await.unwrap();
     }
 }
